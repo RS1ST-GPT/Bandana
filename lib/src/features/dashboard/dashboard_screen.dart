@@ -5,11 +5,12 @@ import 'package:flutter/material.dart';
 import '../../core/di/service_locator.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/constants/ble_constants.dart';
+import '../../features/record/session_detail_screen.dart';
 import '../../services/band_assignment_manager.dart';
 import '../../services/ble_service.dart';
 import '../../services/database_service.dart';
 import '../../services/ml_service.dart';
-import '../../widgets/activity_card.dart';
+import '../../shared/widgets/cards/activity_card.dart';
 
 /// Dashboard screen – high-level summary of recorded activities and model status.
 class DashboardScreen extends StatefulWidget {
@@ -26,6 +27,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   final _assignment = getIt<BandAssignmentManager>();
 
   Map<String, ({int sessionCount, int totalSamples})> _summaries = {};
+  List<Session> _sessions = [];
   bool _isLoading = true;
   bool _isTraining = false;
   String? _trainingError;
@@ -59,15 +61,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Future<void> _loadData() async {
     setState(() => _isLoading = true);
     final summaries = await _db.getSessionSummaries();
+    final sessions = await _db.getAllSessions();
     if (mounted) {
       setState(() {
         _summaries = summaries;
+        _sessions = sessions;
         _isLoading = false;
       });
     }
   }
 
-  Future<void> _trainModel() async {
+  Future<void> trainModel({bool combined = false}) async {
     setState(() {
       _isTraining = true;
       _trainingError = null;
@@ -95,7 +99,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
       // Run training (computationally intensive for large datasets).
       // Convert to format expected by ML service (features, label only)
       final trainingData = data.map((d) => (features: d.features, label: d.label)).toList();
-      final success = _ml.train(trainingData);
+      final success = combined
+          ? await _ml.trainCombined(trainingData)
+          : await _ml.trainSingleBand(trainingData);
 
       if (mounted) {
         setState(() {
@@ -105,15 +111,27 @@ class _DashboardScreenState extends State<DashboardScreen> {
           }
         });
         if (success) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(
-                'Model trained! ${_ml.trainedClassCount} classes, '
-                '${_ml.trainedSampleCount} samples.',
+          if (combined) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  'Combined model trained! ${_ml.trainedClassCountCombined} classes, '
+                  '${_ml.trainedSampleCountCombined} samples.',
+                ),
+                behavior: SnackBarBehavior.floating,
               ),
-              behavior: SnackBarBehavior.floating,
-            ),
-          );
+            );
+          } else {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  'Single-band model trained! ${_ml.trainedClassCount} classes, '
+                  '${_ml.trainedSampleCount} samples.',
+                ),
+                behavior: SnackBarBehavior.floating,
+              ),
+            );
+          }
         }
       }
     } catch (e) {
@@ -161,16 +179,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           Row(
                             children: [
                               Icon(
-                                _ml.isTrained
+                                _ml.isTrained || _ml.isCombinedTrained
                                     ? Icons.check_circle
                                     : Icons.model_training,
-                                color: _ml.isTrained
+                                color: _ml.isTrained || _ml.isCombinedTrained
                                     ? Colors.green
                                     : theme.colorScheme.onSurfaceVariant,
                               ),
                               const SizedBox(width: 8),
                               Text(
-                                'ML Model',
+                                'ML Models',
                                 style: theme.textTheme.titleMedium?.copyWith(
                                   fontWeight: FontWeight.w600,
                                 ),
@@ -179,19 +197,37 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           ),
                           const SizedBox(height: 12),
                           _buildStatRow(
-                            'Status',
+                            'Single-Band (30 feat)',
                             _ml.isTrained ? 'Trained ✓' : 'Not trained',
                             theme,
                           ),
                           if (_ml.isTrained) ...[
                             _buildStatRow(
-                              'Classes',
+                              'Classes (30-feat)',
                               '${_ml.trainedClassCount}',
                               theme,
                             ),
                             _buildStatRow(
-                              'Training Samples',
+                              'Samples (30-feat)',
                               '${_ml.trainedSampleCount}',
+                              theme,
+                            ),
+                          ],
+                          const SizedBox(height: 8),
+                          _buildStatRow(
+                            'Combined Dual-Band (60 feat)',
+                            _ml.isCombinedTrained ? 'Trained ✓' : 'Not trained',
+                            theme,
+                          ),
+                          if (_ml.isCombinedTrained) ...[
+                            _buildStatRow(
+                              'Classes (60-feat)',
+                              '${_ml.trainedClassCountCombined}',
+                              theme,
+                            ),
+                            _buildStatRow(
+                              'Samples (60-feat)',
+                              '${_ml.trainedSampleCountCombined}',
                               theme,
                             ),
                           ],
@@ -324,6 +360,100 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         );
                       },
                     ),
+
+                   // ── Session List ──
+                   const SizedBox(height: AppTheme.spacingMd),
+                   Text(
+                     'All Sessions',
+                     style: theme.textTheme.titleSmall?.copyWith(
+                       fontWeight: FontWeight.w600,
+                       color: theme.colorScheme.onSurfaceVariant,
+                     ),
+                   ),
+                   const SizedBox(height: AppTheme.spacingSm),
+                   if (_sessions.isEmpty)
+                     Card(
+                       child: Padding(
+                         padding: const EdgeInsets.all(AppTheme.spacingLg),
+                         child: Column(
+                           children: [
+                             Icon(
+                               Icons.history,
+                               size: 48,
+                               color: theme.colorScheme.onSurfaceVariant,
+                             ),
+                             const SizedBox(height: 12),
+                             Text(
+                               'No sessions yet',
+                               style: theme.textTheme.bodyLarge?.copyWith(
+                                 color: theme.colorScheme.onSurfaceVariant,
+                               ),
+                             ),
+                             const SizedBox(height: 4),
+                             Text(
+                               'Start recording to create sessions.',
+                               style: theme.textTheme.bodySmall?.copyWith(
+                                 color: theme.colorScheme.onSurfaceVariant,
+                               ),
+                               textAlign: TextAlign.center,
+                             ),
+                           ],
+                         ),
+                       ),
+                     )
+                   else
+                     ListView.separated(
+                       shrinkWrap: true,
+                       physics: const NeverScrollableScrollPhysics(),
+                       itemCount: _sessions.length,
+                       separatorBuilder: (context, index) => const Divider(height: 1),
+                       itemBuilder: (context, index) {
+                         final session = _sessions[index];
+                         final duration = session.endTime != null
+                             ? session.endTime!.difference(session.startTime)
+                             : DateTime.now().difference(session.startTime);
+                         final hours = duration.inHours;
+                         final minutes = duration.inMinutes % 60;
+                         final seconds = duration.inSeconds % 60;
+                         String durationStr;
+                         if (hours > 0) {
+                           durationStr = '${hours}h ${minutes}m ${seconds}s';
+                         } else if (minutes > 0) {
+                           durationStr = '${minutes}m ${seconds}s';
+                         } else {
+                           durationStr = '${seconds}s';
+                         }
+                         final dateStr =
+                             '${session.startTime.year}-${session.startTime.month.toString().padLeft(2, '0')}-${session.startTime.day.toString().padLeft(2, '0')} '
+                             '${session.startTime.hour.toString().padLeft(2, '0')}:${session.startTime.minute.toString().padLeft(2, '0')}';
+                         return ListTile(
+                           dense: true,
+                           leading: CircleAvatar(
+                             backgroundColor: theme.colorScheme.primaryContainer,
+                             child: Text(
+                               session.id.toString(),
+                               style: theme.textTheme.labelMedium?.copyWith(
+                                 color: theme.colorScheme.onPrimaryContainer,
+                                 fontWeight: FontWeight.w600,
+                               ),
+                             ),
+                           ),
+                           title: Text(session.label),
+                           subtitle: Text(
+                             '$dateStr  •  $durationStr  •  ${session.sampleCount} windows',
+                             style: theme.textTheme.bodySmall?.copyWith(
+                               color: theme.colorScheme.onSurfaceVariant,
+                             ),
+                           ),
+                           trailing: const Icon(Icons.chevron_right),
+                           onTap: () => Navigator.of(context).push(
+                             MaterialPageRoute(
+                               builder: (_) => SessionDetailScreen(sessionId: session.id),
+                             ),
+                           ),
+                         );
+                       },
+                     ),
                 ],
               ),
       ),
@@ -338,11 +468,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               ),
               label: const Text('Training…'),
             )
-          : FloatingActionButton.extended(
-              onPressed: _trainModel,
-              icon: const Icon(Icons.model_training),
-              label: const Text('Train Model'),
-            ),
+          : null, // Removed training FABs - use Profile → Model Training instead
     );
   }
 

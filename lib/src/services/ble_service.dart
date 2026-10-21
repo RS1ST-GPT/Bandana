@@ -25,12 +25,23 @@ class BandConnection {
 
   BandConnectionState _state = BandConnectionState.disconnected;
   BluetoothDevice? _device;
+  BluetoothCharacteristic? _controlCharacteristic;
   StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
   StreamSubscription<List<int>>? _notifySubscription;
   StreamSubscription<List<ScanResult>>? _scanSubscription;
 
   final _sensorController = StreamController<ImuSample>.broadcast();
   final _stateController = StreamController<BandConnectionState>.broadcast();
+  final _offlineSyncSampleController = StreamController<ImuSample>.broadcast();
+  final _offlineSyncCompleteController = StreamController<int>.broadcast();
+
+  // Connection health tracking
+  DateTime? _lastPacketTime;
+  int _packetCount = 0;
+
+  // Offline Sync State
+  bool _isOfflineSyncing = false;
+  int _offlineSyncedPacketCount = 0;
 
   BandConnection({required this.role});
 
@@ -40,14 +51,39 @@ class BandConnection {
   /// Stream of connection state changes for this band.
   Stream<BandConnectionState> get stateStream => _stateController.stream;
 
+  /// Stream of historical IMU samples received during offline sync.
+  Stream<ImuSample> get offlineSyncSampleStream => _offlineSyncSampleController.stream;
+
+  /// Emits the total sample count when an offline catch-up sync finishes.
+  Stream<int> get offlineSyncCompleteStream => _offlineSyncCompleteController.stream;
+
+  /// Whether this band is actively receiving offline catch-up data.
+  bool get isOfflineSyncing => _isOfflineSyncing;
+
   /// Current connection state (synchronous access).
   BandConnectionState get currentState => _state;
+
+  /// For testing/mocking connection state transitions.
+  void updateStateForTesting(BandConnectionState state) {
+    _state = state;
+    _stateController.add(state);
+  }
 
   /// The connected device's platform name, if any.
   String? get deviceName => _device?.platformName;
 
   /// The connected device's remote ID (MAC on Android).
   String? get deviceId => _device?.remoteId.str;
+
+  /// Time of last received packet, or null if no packets received.
+  DateTime? get lastPacketTime => _lastPacketTime;
+
+  /// Total number of packets received since connection.
+  int get packetCount => _packetCount;
+
+  /// Whether the connection is considered stale (no packets for 5 seconds).
+  bool get isStale => _lastPacketTime != null &&
+      DateTime.now().difference(_lastPacketTime!).inSeconds > 5;
 
   /// RSSI of the connected device.
   Future<int?> get rssi async {
@@ -85,7 +121,11 @@ class BandConnection {
       }
     });
 
-    await FlutterBluePlus.startScan(timeout: BleConstants.scanTimeout);
+    try {
+      await FlutterBluePlus.startScan(timeout: BleConstants.scanTimeout);
+    } catch (_) {
+      // Silently handle if Bluetooth is off or permissions not yet granted
+    }
 
     if (_state == BandConnectionState.scanning) {
       _updateState(BandConnectionState.disconnected);
@@ -94,7 +134,9 @@ class BandConnection {
 
   /// Stop scanning for this band.
   Future<void> stopScan() async {
-    await FlutterBluePlus.stopScan();
+    try {
+      await FlutterBluePlus.stopScan();
+    } catch (_) {}
     await _scanSubscription?.cancel();
     if (_state == BandConnectionState.scanning) {
       _updateState(BandConnectionState.disconnected);
@@ -104,7 +146,9 @@ class BandConnection {
   /// Connect to a specific device (used when user manually assigns).
   Future<void> connectToDevice(BluetoothDevice device) async {
     await _scanSubscription?.cancel();
-    await FlutterBluePlus.stopScan();
+    try {
+      await FlutterBluePlus.stopScan();
+    } catch (_) {}
     _connectToDevice(device);
   }
 
@@ -134,30 +178,37 @@ class BandConnection {
 
   Future<void> _discoverAndSubscribe(BluetoothDevice device) async {
     final services = await device.discoverServices();
+    _controlCharacteristic = null;
 
     for (final service in services) {
       if (service.uuid.toString().toLowerCase() ==
           BleConstants.serviceUuid.toLowerCase()) {
         for (final char in service.characteristics) {
-          if (char.uuid.toString().toLowerCase() ==
-              BleConstants.characteristicUuid.toLowerCase()) {
+          final uuid = char.uuid.toString().toLowerCase();
+          if (uuid == BleConstants.characteristicUuid.toLowerCase()) {
             await char.setNotifyValue(true);
             _notifySubscription = char.lastValueStream.listen(_onDataReceived);
             device.cancelWhenDisconnected(_notifySubscription!);
-            return;
+          } else if (uuid == BleConstants.controlCharacteristicUuid.toLowerCase()) {
+            _controlCharacteristic = char;
           }
         }
       }
     }
 
-    // Fallback: first notify characteristic
-    for (final service in services) {
-      for (final char in service.characteristics) {
-        if (char.properties.notify) {
-          await char.setNotifyValue(true);
-          _notifySubscription = char.lastValueStream.listen(_onDataReceived);
-          device.cancelWhenDisconnected(_notifySubscription!);
-          return;
+    // Fallback: first notify characteristic and writable characteristic
+    if (_notifySubscription == null) {
+      for (final service in services) {
+        for (final char in service.characteristics) {
+          if (char.properties.notify && _notifySubscription == null) {
+            await char.setNotifyValue(true);
+            _notifySubscription = char.lastValueStream.listen(_onDataReceived);
+            device.cancelWhenDisconnected(_notifySubscription!);
+          }
+          if ((char.properties.write || char.properties.writeWithoutResponse) &&
+              _controlCharacteristic == null) {
+            _controlCharacteristic = char;
+          }
         }
       }
     }
@@ -166,41 +217,131 @@ class BandConnection {
   void _onDataReceived(List<int> value) {
     if (value.isEmpty) return;
     try {
-      final csv = utf8.decode(value).trim();
-      if (csv.isEmpty) return;
+      final receiveTimestamp = DateTime.now();
 
-      final lines = csv.split('\n');
-      for (final line in lines) {
-        final trimmed = line.trim();
-        if (trimmed.isNotEmpty) {
-          final sample = ImuSample.tryParseCsv(
-            csv: trimmed,
+      // Check for 4-byte EOF notification marker (0xFFFFFFFF) from firmware
+      if (value.length == 4 &&
+          value[0] == 0xFF &&
+          value[1] == 0xFF &&
+          value[2] == 0xFF &&
+          value[3] == 0xFF) {
+        if (_isOfflineSyncing) {
+          _isOfflineSyncing = false;
+          final count = _offlineSyncedPacketCount;
+          _offlineSyncCompleteController.add(count);
+          // Automatically clear offline storage on the band after successful download
+          clearOfflineStorage();
+        }
+        return;
+      }
+
+      // Priority Path: 20-byte packed binary payload (Choice B)
+      if (value.length >= 20 && value.length % 20 == 0) {
+        for (var offset = 0; offset < value.length; offset += 20) {
+          final chunk = value.sublist(offset, offset + 20);
+          final sample = ImuSample.fromBinary(
+            chunk,
             bandRole: role,
             deviceId: _device?.remoteId.str ?? '',
             deviceName: _device?.platformName ?? 'Unknown',
+            timestamp: receiveTimestamp,
           );
-          if (sample != null) {
+          if (_isOfflineSyncing) {
+            _offlineSyncedPacketCount++;
+            _offlineSyncSampleController.add(sample);
+          } else {
             _sensorController.add(sample);
           }
         }
+      } else {
+        // Fallback: Legacy CSV string splitting
+        final csv = utf8.decode(value).trim();
+        if (csv.isEmpty) return;
+
+        final lines = csv.split('\n');
+        for (final line in lines) {
+          final trimmed = line.trim();
+          if (trimmed.isNotEmpty) {
+            final sample = ImuSample.tryParseCsv(
+              csv: trimmed,
+              bandRole: role,
+              deviceId: _device?.remoteId.str ?? '',
+              deviceName: _device?.platformName ?? 'Unknown',
+              timestamp: receiveTimestamp,
+            );
+            if (sample != null) {
+              _sensorController.add(sample);
+            }
+          }
+        }
       }
+
+      // Update connection health metrics (BLE receive time)
+      _lastPacketTime = receiveTimestamp;
+      _packetCount++;
     } catch (_) {
       // Silently skip malformed packets
     }
   }
 
   Future<void> disconnect() async {
-    await _notifySubscription?.cancel();
-    await _device?.disconnect();
+    try {
+      await _notifySubscription?.cancel();
+    } catch (_) {}
+    try {
+      await _device?.disconnect();
+    } catch (_) {}
     _handleDisconnect();
   }
 
   void _handleDisconnect() {
     _device = null;
+    _controlCharacteristic = null;
     _notifySubscription = null;
     _connectionSubscription?.cancel();
     _connectionSubscription = null;
+    _lastPacketTime = null;
+    _packetCount = 0;
+    _isOfflineSyncing = false;
+    _offlineSyncedPacketCount = 0;
     _updateState(BandConnectionState.disconnected);
+  }
+
+  /// Send raw byte command to the band's control characteristic.
+  Future<bool> sendControlCommand(List<int> bytes) async {
+    if (_controlCharacteristic == null) return false;
+    try {
+      await _controlCharacteristic!.write(
+        bytes,
+        withoutResponse: _controlCharacteristic!.properties.writeWithoutResponse,
+      );
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Sends OP_START_RECORDING (0x01) with optional activity label marker.
+  Future<bool> startRecording({String label = ''}) async {
+    final payload = <int>[BleConstants.opcodeStartRecording, ...utf8.encode(label)];
+    return sendControlCommand(payload);
+  }
+
+  /// Sends OP_STOP_RECORDING (0x02) to flush and seal SD storage.
+  Future<bool> stopRecording() async {
+    return sendControlCommand([BleConstants.opcodeStopRecording]);
+  }
+
+  /// Sends OP_START_OFFLINE_SYNC (0x03) to trigger batch catch-up of /raw_imu.bin.
+  Future<bool> startOfflineSync() async {
+    _isOfflineSyncing = true;
+    _offlineSyncedPacketCount = 0;
+    return sendControlCommand([BleConstants.opcodeStartOfflineSync]);
+  }
+
+  /// Sends OP_CLEAR_OFFLINE_STORAGE (0x04) to truncate/erase /raw_imu.bin after download.
+  Future<bool> clearOfflineStorage() async {
+    return sendControlCommand([BleConstants.opcodeClearOfflineStorage]);
   }
 
   void _updateState(BandConnectionState state) {
@@ -220,6 +361,8 @@ class BandConnection {
     await _scanSubscription?.cancel();
     await _sensorController.close();
     await _stateController.close();
+    await _offlineSyncSampleController.close();
+    await _offlineSyncCompleteController.close();
   }
 }
 
@@ -269,6 +412,30 @@ class BleService {
   /// Connect a specific band to a device (for manual assignment).
   Future<void> connectBand(BandRole role, BluetoothDevice device) async {
     await getConnection(role).connectToDevice(device);
+  }
+
+  /// Broadcast recording start command with activity label to connected bands.
+  Future<bool> startRecording({String label = ''}) async {
+    final w = await wrist.startRecording(label: label);
+    final a = await ankle.startRecording(label: label);
+    return w || a;
+  }
+
+  /// Broadcast recording stop command to connected bands.
+  Future<bool> stopRecording() async {
+    final w = await wrist.stopRecording();
+    final a = await ankle.stopRecording();
+    return w || a;
+  }
+
+  /// Request offline sync from specified band.
+  Future<bool> startOfflineSync(BandRole role) async {
+    return getConnection(role).startOfflineSync();
+  }
+
+  /// Erase offline SD storage on specified band.
+  Future<bool> clearOfflineStorage(BandRole role) async {
+    return getConnection(role).clearOfflineStorage();
   }
 
   /// Release all resources.

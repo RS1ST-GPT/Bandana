@@ -44,6 +44,13 @@ dependencies:
   # Persistent storage
   shared_preferences: ^2.2.0
 
+  # File sharing
+  share_plus: ^10.0.0
+  archive: ^4.5.2
+
+  # On-device Deep Learning Inference
+  tflite_flutter: ^0.12.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -53,6 +60,14 @@ dev_dependencies:
   # Drift code generation
   drift_dev: ^2.22.0
   build_runner: ^2.4.0
+  mocktail: ^1.0.5
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/banadana_logo.png
+    - assets/models/model_1d_cnn.tflite
+    - assets/models/model_conv_gru.tflite
+    - assets/models/model_logistic_regression.tflite
+    - assets/models/dual_band_model.tflite
+    - assets/models/labels.txt

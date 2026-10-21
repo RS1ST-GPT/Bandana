@@ -8,6 +8,7 @@ import 'dart:io';
 
 import '../core/constants/ble_constants.dart';
 import '../models/imu_sample.dart' as model;
+import '../utils/filename_utils.dart';
 
 part 'database_service.g.dart';
 
@@ -17,9 +18,11 @@ part 'database_service.g.dart';
 class Sessions extends Table {
   IntColumn get id => integer().autoIncrement()();
   TextColumn get label => text()();
+  TextColumn get participantId => text().withDefault(const Constant('participant_1'))();
   DateTimeColumn get startTime => dateTime()();
   DateTimeColumn get endTime => dateTime().nullable()();
   IntColumn get sampleCount => integer().withDefault(const Constant(0))();
+  TextColumn get notes => text().nullable()();
 }
 
 /// Individual IMU samples stored for each band during recording.
@@ -38,6 +41,7 @@ class ImuSampleRecords extends Table {
   RealColumn get gz => real()();
   RealColumn get accelMagnitude => real()();
   RealColumn get gyroMagnitude => real()();
+  IntColumn get captureTimestampMs => integer().withDefault(const Constant(-1))();
   DateTimeColumn get timestamp => dateTime()();
 }
 
@@ -51,14 +55,36 @@ class SensorWindows extends Table {
   DateTimeColumn get timestamp => dateTime()();
 }
 
+/// User feedback on predictions for supervised candidate model improvement.
+class PredictionFeedbacks extends Table {
+  IntColumn get id => integer().autoIncrement()();
+  TextColumn get predictedLabel => text()();
+  TextColumn get userFeedback => text()(); // 'correct' or 'incorrect'
+  TextColumn get correctedLabel => text().nullable()();
+  TextColumn get modelVersion => text()(); // e.g. 'knn_30_v1', 'softmax_60_v1'
+  RealColumn get confidence => real().nullable()();
+  IntColumn get sessionId => integer().nullable().references(Sessions, #id)();
+  DateTimeColumn get timestamp => dateTime()();
+  BoolColumn get isReviewed => boolean().withDefault(const Constant(false))();
+}
+
 // ── Database ──
 
-@DriftDatabase(tables: [Sessions, ImuSampleRecords, SensorWindows])
+@DriftDatabase(tables: [Sessions, ImuSampleRecords, SensorWindows, PredictionFeedbacks])
 class DatabaseService extends _$DatabaseService {
   DatabaseService() : super(_openConnection());
 
+  /// Creates a DatabaseService instance with a custom executor for testing.
+  DatabaseService.withExecutor(super.executor);
+
   @override
-  int get schemaVersion => 2;
+  int get schemaVersion => 5;
+
+  /// Store DateTime as text (ISO-8601) to preserve millisecond precision.
+  /// Default is false which stores as unix timestamps (seconds only).
+  @override
+  DriftDatabaseOptions get options =>
+      const DriftDatabaseOptions(storeDateTimeAsText: true);
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -71,16 +97,58 @@ class DatabaseService extends _$DatabaseService {
             await m.createTable(imuSampleRecords);
             await m.addColumn(sensorWindows, sensorWindows.bandRole);
           }
+          if (from < 3) {
+            // Add notes column to sessions table
+            await m.addColumn(sessions, sessions.notes);
+          }
+          if (from < 4) {
+            // Migrate DateTime storage from INTEGER (unix seconds) to TEXT (ISO-8601).
+            // This is required because storeDateTimeAsText was enabled.
+            // Use TableMigration with DateTimeExpressions.fromUnixEpoch to convert.
+            // Cast columns to int since they were stored as unix timestamps.
+            await m.alterTable(TableMigration(
+              sessions,
+              columnTransformer: {
+                sessions.startTime:
+                    DateTimeExpressions.fromUnixEpoch(sessions.startTime.cast<int>()),
+                sessions.endTime:
+                    DateTimeExpressions.fromUnixEpoch(sessions.endTime.cast<int>()),
+              },
+            ));
+            await m.alterTable(TableMigration(
+              imuSampleRecords,
+              columnTransformer: {
+                imuSampleRecords.timestamp:
+                    DateTimeExpressions.fromUnixEpoch(imuSampleRecords.timestamp.cast<int>()),
+              },
+            ));
+            await m.alterTable(TableMigration(
+              sensorWindows,
+              columnTransformer: {
+                sensorWindows.timestamp:
+                    DateTimeExpressions.fromUnixEpoch(sensorWindows.timestamp.cast<int>()),
+              },
+            ));
+          }
+          if (from < 5) {
+            await m.addColumn(sessions, sessions.participantId);
+            await m.addColumn(imuSampleRecords, imuSampleRecords.captureTimestampMs);
+            await m.createTable(predictionFeedbacks);
+          }
         },
       );
 
   // ── Sessions ──
 
   /// Create a new recording session and return its ID.
-  Future<int> createSession(String label) async {
+  Future<int> createSession(
+    String label, {
+    String participantId = 'participant_1',
+  }) async {
     final id = await into(sessions).insert(
       SessionsCompanion.insert(
         label: label,
+        participantId: Value(participantId),
         startTime: DateTime.now(),
       ),
     );
@@ -94,6 +162,13 @@ class DatabaseService extends _$DatabaseService {
         endTime: Value(DateTime.now()),
         sampleCount: Value(sampleCount),
       ),
+    );
+  }
+
+  /// Update session notes.
+  Future<void> updateSessionNotes(int sessionId, String notes) async {
+    await (update(sessions)..where((s) => s.id.equals(sessionId))).write(
+      SessionsCompanion(notes: Value(notes)),
     );
   }
 
@@ -150,6 +225,7 @@ class DatabaseService extends _$DatabaseService {
             gz: Value(sample.gz),
             accelMagnitude: Value(sample.accelMagnitude),
             gyroMagnitude: Value(sample.gyroMagnitude),
+            captureTimestampMs: Value(sample.captureTimestampMs),
             timestamp: Value(sample.timestamp),
           ),
         );
@@ -182,6 +258,7 @@ class DatabaseService extends _$DatabaseService {
       gz: r.gz,
       accelMagnitude: r.accelMagnitude,
       gyroMagnitude: r.gyroMagnitude,
+      captureTimestampMs: r.captureTimestampMs,
       timestamp: r.timestamp,
     )).toList();
   }
@@ -193,6 +270,138 @@ class DatabaseService extends _$DatabaseService {
     query.where(imuSampleRecords.sessionId.equals(sessionId));
     final result = await query.getSingle();
     return result.read(count) ?? 0;
+  }
+
+  /// Get sample counts per band role for a session.
+  Future<Map<BandRole, int>> getSampleCountsByRole(int sessionId) async {
+    final map = <BandRole, int>{};
+    for (final role in BandRole.values) {
+      final count = countAll();
+      final query = selectOnly(imuSampleRecords)..addColumns([count]);
+      query.where(imuSampleRecords.sessionId.equals(sessionId));
+      query.where(imuSampleRecords.bandRole.equals(role.name));
+      final result = await query.getSingle();
+      map[role] = result.read(count) ?? 0;
+    }
+    return map;
+  }
+
+  /// Get window count for a session and band role.
+  Future<int> getWindowCount(int sessionId, BandRole role) async {
+    final count = countAll();
+    final query = selectOnly(sensorWindows)..addColumns([count]);
+    query.where(sensorWindows.sessionId.equals(sessionId));
+    query.where(sensorWindows.bandRole.equals(role.name));
+    final result = await query.getSingle();
+    return result.read(count) ?? 0;
+  }
+
+  /// Export raw IMU samples for a session as CSV.
+  ///
+  /// Returns the path to the exported CSV file.
+  /// Generates standardized filename: `participant_activity_YYYYMMDD_HHmmss.csv`
+  Future<String> exportSessionCsv(int sessionId) async {
+    final samples = await getImuSamples(sessionId: sessionId);
+    if (samples.isEmpty) {
+      throw StateError('No samples to export for session $sessionId');
+    }
+
+    // Fetch session details for activity and participant metadata
+    final sessions = await getAllSessions();
+    final session = sessions.cast<Session?>().firstWhere(
+      (s) => s?.id == sessionId,
+      orElse: () => null,
+    );
+    final participant = session?.participantId ?? 'participant_1';
+    final activity = session?.label ?? 'activity';
+    final startTime = session?.startTime ?? DateTime.now();
+
+    final directory = await getApplicationDocumentsDirectory();
+    final fileName = FilenameUtils.generateSessionCsvFilename(
+      participantId: participant,
+      activityLabel: activity,
+      timestamp: startTime,
+    );
+    final file = await FilenameUtils.resolveUniqueFile(directory, fileName);
+
+    final buffer = StringBuffer();
+    // Metadata comments header
+    buffer.writeln('# BANDANA IMU Session Export');
+    buffer.writeln('# Schema: Standardized Synchronized Dual-Band');
+    buffer.writeln('# Session ID: $sessionId');
+    buffer.writeln('# Participant ID: $participant');
+    buffer.writeln('# Activity: $activity');
+    buffer.writeln('# Start Time: ${startTime.toIso8601String()}');
+    buffer.writeln('# Note: sensor_tick_ms corresponds to firmware captureTimestampMs');
+    if (session?.notes != null && session!.notes!.isNotEmpty) {
+      buffer.writeln('# Notes: ${session.notes!.replaceAll('\n', ' ')}');
+    }
+    // Standardized Synchronized Dual-Band CSV Header
+    buffer.writeln(
+      'timestamp_phone_ms,sensor_tick_ms,seq,wrist_ax,wrist_ay,wrist_az,wrist_gx,wrist_gy,wrist_gz,ankle_ax,ankle_ay,ankle_az,ankle_gx,ankle_gy,ankle_gz,activity',
+    );
+
+    final wristSamples = samples.where((s) => s.bandRole == BandRole.wrist).toList();
+    final ankleSamples = samples.where((s) => s.bandRole == BandRole.ankle).toList();
+
+    if (wristSamples.isNotEmpty && ankleSamples.isNotEmpty) {
+      // Synchronized dual-band pairing via nearest-neighbor timestamp matching
+      int ankleIdx = 0;
+      int seq = 0;
+      for (final w in wristSamples) {
+        final wMs = w.timestamp.millisecondsSinceEpoch;
+        while (ankleIdx + 1 < ankleSamples.length &&
+            (ankleSamples[ankleIdx + 1].timestamp.millisecondsSinceEpoch - wMs).abs() <=
+                (ankleSamples[ankleIdx].timestamp.millisecondsSinceEpoch - wMs).abs()) {
+          ankleIdx++;
+        }
+        final a = ankleSamples[ankleIdx];
+        final tick = w.captureTimestampMs >= 0 ? w.captureTimestampMs : 0;
+
+        buffer.writeln(
+          '$wMs,$tick,$seq,'
+          '${w.ax.toStringAsFixed(4)},${w.ay.toStringAsFixed(4)},${w.az.toStringAsFixed(4)},'
+          '${w.gx.toStringAsFixed(2)},${w.gy.toStringAsFixed(2)},${w.gz.toStringAsFixed(2)},'
+          '${a.ax.toStringAsFixed(4)},${a.ay.toStringAsFixed(4)},${a.az.toStringAsFixed(4)},'
+          '${a.gx.toStringAsFixed(2)},${a.gy.toStringAsFixed(2)},${a.gz.toStringAsFixed(2)},'
+          '$activity',
+        );
+        seq++;
+      }
+    } else if (wristSamples.isNotEmpty) {
+      // Wrist only recording
+      int seq = 0;
+      for (final w in wristSamples) {
+        final wMs = w.timestamp.millisecondsSinceEpoch;
+        final tick = w.captureTimestampMs >= 0 ? w.captureTimestampMs : 0;
+        buffer.writeln(
+          '$wMs,$tick,$seq,'
+          '${w.ax.toStringAsFixed(4)},${w.ay.toStringAsFixed(4)},${w.az.toStringAsFixed(4)},'
+          '${w.gx.toStringAsFixed(2)},${w.gy.toStringAsFixed(2)},${w.gz.toStringAsFixed(2)},'
+          '0.0000,0.0000,0.0000,0.00,0.00,0.00,'
+          '$activity',
+        );
+        seq++;
+      }
+    } else {
+      // Ankle only recording
+      int seq = 0;
+      for (final a in ankleSamples) {
+        final aMs = a.timestamp.millisecondsSinceEpoch;
+        final tick = a.captureTimestampMs >= 0 ? a.captureTimestampMs : 0;
+        buffer.writeln(
+          '$aMs,$tick,$seq,'
+          '0.0000,0.0000,0.0000,0.00,0.00,0.00,'
+          '${a.ax.toStringAsFixed(4)},${a.ay.toStringAsFixed(4)},${a.az.toStringAsFixed(4)},'
+          '${a.gx.toStringAsFixed(2)},${a.gy.toStringAsFixed(2)},${a.gz.toStringAsFixed(2)},'
+          '$activity',
+        );
+        seq++;
+      }
+    }
+
+    await file.writeAsString(buffer.toString());
+    return file.path;
   }
 
   // ── Sensor Windows (for ML training) ──
@@ -243,6 +452,82 @@ class DatabaseService extends _$DatabaseService {
     }).toList();
   }
 
+  /// Get windows for training filtered by session IDs and band role.
+  Future<List<({List<double> features, String label})>>
+      getWindowsForTrainingBySessions({
+    required List<int> sessionIds,
+    required BandRole bandRole,
+  }) async {
+    if (sessionIds.isEmpty) return [];
+    final rows = await (select(sensorWindows)
+          ..where((w) => w.bandRole.equals(bandRole.name))
+          ..where((w) => w.sessionId.isIn(sessionIds)))
+        .get();
+    return rows.map((row) {
+      final featureList =
+          (jsonDecode(row.features) as List).cast<num>().map((n) => n.toDouble()).toList();
+      return (features: featureList, label: row.label);
+    }).toList();
+  }
+
+  /// Get windows for combined dual-band training filtered by session IDs.
+  /// Returns pairs of (wrist features, ankle features, label) for sessions that have both.
+  Future<List<({List<double> wristFeatures, List<double> ankleFeatures, String label})>>
+      getCombinedWindowsForTrainingBySessions({
+    required List<int> sessionIds,
+  }) async {
+    if (sessionIds.isEmpty) return [];
+
+    // Get wrist windows for these sessions
+    final wristRows = await (select(sensorWindows)
+          ..where((w) => w.bandRole.equals(BandRole.wrist.name))
+          ..where((w) => w.sessionId.isIn(sessionIds)))
+        .get();
+
+    // Get ankle windows for these sessions
+    final ankleRows = await (select(sensorWindows)
+          ..where((w) => w.bandRole.equals(BandRole.ankle.name))
+          ..where((w) => w.sessionId.isIn(sessionIds)))
+        .get();
+
+    // Group by session ID and label - store lists to preserve all windows
+    final wristMap = <String, List<({List<double> features, String label})>>{};
+    final ankleMap = <String, List<({List<double> features, String label})>>{};
+
+    for (final row in wristRows) {
+      final featureList =
+          (jsonDecode(row.features) as List).cast<num>().map((n) => n.toDouble()).toList();
+      final key = '${row.sessionId}_${row.label}';
+      wristMap.putIfAbsent(key, () => []).add((features: featureList, label: row.label));
+    }
+
+    for (final row in ankleRows) {
+      final featureList =
+          (jsonDecode(row.features) as List).cast<num>().map((n) => n.toDouble()).toList();
+      final key = '${row.sessionId}_${row.label}';
+      ankleMap.putIfAbsent(key, () => []).add((features: featureList, label: row.label));
+    }
+
+    // Combine pairs - pair each wrist window with each ankle window for the same session+label
+    final combined = <({List<double> wristFeatures, List<double> ankleFeatures, String label})>[];
+    for (final entry in wristMap.entries) {
+      final ankleList = ankleMap[entry.key];
+      if (ankleList != null) {
+        for (final wristEntry in entry.value) {
+          for (final ankleEntry in ankleList) {
+            combined.add((
+              wristFeatures: wristEntry.features,
+              ankleFeatures: ankleEntry.features,
+              label: wristEntry.label,
+            ));
+          }
+        }
+      }
+    }
+
+    return combined;
+  }
+
   /// Total number of stored windows across all sessions.
   Future<int> get totalWindowCount async {
     final count = countAll();
@@ -272,10 +557,56 @@ class DatabaseService extends _$DatabaseService {
     return map;
   }
 
+  // ── Prediction Feedbacks ──
+
+  /// Record user feedback on an activity prediction.
+  Future<int> insertPredictionFeedback({
+    required String predictedLabel,
+    required String userFeedback,
+    String? correctedLabel,
+    required String modelVersion,
+    double? confidence,
+    int? sessionId,
+  }) async {
+    return into(predictionFeedbacks).insert(
+      PredictionFeedbacksCompanion.insert(
+        predictedLabel: predictedLabel,
+        userFeedback: userFeedback,
+        correctedLabel: Value(correctedLabel),
+        modelVersion: modelVersion,
+        confidence: Value(confidence),
+        sessionId: Value(sessionId),
+        timestamp: DateTime.now(),
+      ),
+    );
+  }
+
+  /// Get all prediction feedback records, newest first.
+  Future<List<PredictionFeedback>> getAllPredictionFeedbacks() {
+    return (select(predictionFeedbacks)
+          ..orderBy([(f) => OrderingTerm.desc(f.timestamp)]))
+        .get();
+  }
+
+  /// Get pending unreviewed feedback records.
+  Future<List<PredictionFeedback>> getUnreviewedFeedbacks() {
+    return (select(predictionFeedbacks)
+          ..where((f) => f.isReviewed.equals(false))
+          ..orderBy([(f) => OrderingTerm.desc(f.timestamp)]))
+        .get();
+  }
+
+  /// Mark a feedback item as reviewed.
+  Future<void> markFeedbackReviewed(int feedbackId) async {
+    await (update(predictionFeedbacks)..where((f) => f.id.equals(feedbackId)))
+        .write(const PredictionFeedbacksCompanion(isReviewed: Value(true)));
+  }
+
   // ── Danger zone ──
 
   /// Delete all sessions and associated data.
   Future<void> clearAll() async {
+    await delete(predictionFeedbacks).go();
     await delete(imuSampleRecords).go();
     await delete(sensorWindows).go();
     await delete(sessions).go();
@@ -299,6 +630,7 @@ class ImuSampleData {
   final double gz;
   final double accelMagnitude;
   final double gyroMagnitude;
+  final int captureTimestampMs;
   final DateTime timestamp;
 
   const ImuSampleData({
@@ -315,6 +647,7 @@ class ImuSampleData {
     required this.gz,
     required this.accelMagnitude,
     required this.gyroMagnitude,
+    this.captureTimestampMs = -1,
     required this.timestamp,
   });
 
@@ -327,6 +660,7 @@ class ImuSampleData {
         gx: gx,
         gy: gy,
         gz: gz,
+        captureTimestampMs: captureTimestampMs,
         timestamp: timestamp,
         bandRole: bandRole,
         deviceId: deviceId,
